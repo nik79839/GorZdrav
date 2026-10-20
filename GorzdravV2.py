@@ -18,7 +18,7 @@ from vk_api.utils import get_random_id
 
 # ============================== НАСТРОЙКИ ==============================
 VK_TOKEN = "vk1.a.NtlIW2sPiZihemQK3FFq7gHleSEHsQW-WDnbZMJgXdY_PqjP169r5T_74y_Lmi8NUK_EWNuFedzjnSqodMcd3emNMjF0kvra2qoztMSOo_l6axkfDIKMBFO2B5mPJT6963nFl8TBpF6JqKSg4qYlw4qG2zIE2bxxNZzIRVuaSTMJhzWtoPPzyislISWVfyOu51jmqSH6hKiSZqhfbvomOg"
-ALLOWED_USERS = {124970852}
+ALLOWED_USERS = {124970852, 227899871}
 POLL_INTERVAL = 30                     
 DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "subscriptions.json")
 # =======================================================================
@@ -223,7 +223,7 @@ def check_sub(sub, cache):
     last = sub.get("last_nearest")
     upd = {"last_nearest": nearest}
     if nearest and (last is None or nearest < last):
-        msg = (f"🔔 Появилась запись!\n\n{sub_header(sub)}\n\nБлижайшая дата: {fmt_dt(nearest)} "
+        msg = (f"🔔 Появилась запись!\n\n{sub_header(sub)}\n\nБлижайшая дата: {fmt_date(nearest)} "
                f"(свободных талонов: {info.get('freeTicketCount')})\n\n"
                f"Запись: https://gorzdrav.spb.ru/service-free-schedule")
         return msg, upd
@@ -244,7 +244,7 @@ def baseline(sub) -> str:
     if info is None:
         return "Врача сейчас нет в списке расписания, но я продолжу следить."
     if info.get("freeTicketCount", 0) > 0 and info.get("nearestDate"):
-        return f"Ближайшая запись сейчас: {fmt_dt(info['nearestDate'])} (талонов: {info['freeTicketCount']})."
+        return f"Ближайшая запись сейчас: {fmt_date(info['nearestDate'])} (талонов: {info['freeTicketCount']})."
     return "Свободных талонов сейчас нет."
 
 
