@@ -20,7 +20,7 @@ from vk_api.utils import get_random_id
 # ============================== НАСТРОЙКИ ==============================
 VK_TOKEN = "vk1.a.NtlIW2sPiZihemQK3FFq7gHleSEHsQW-WDnbZMJgXdY_PqjP169r5T_74y_Lmi8NUK_EWNuFedzjnSqodMcd3emNMjF0kvra2qoztMSOo_l6axkfDIKMBFO2B5mPJT6963nFl8TBpF6JqKSg4qYlw4qG2zIE2bxxNZzIRVuaSTMJhzWtoPPzyislISWVfyOu51jmqSH6hKiSZqhfbvomOg"
 ALLOWED_USERS = {124970852, 227899871}
-POLL_INTERVAL = 30                     
+POLL_INTERVAL = 30
 DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "subscriptions.json")
 # =======================================================================
 
@@ -226,7 +226,7 @@ def check_sub(sub, cache):
     if nearest and (last is None or nearest < last):
         msg = (f"🔔 Появилась запись!\n\n{sub_header(sub)}\n\nБлижайшая дата: {fmt_date(nearest)} "
                f"(свободных талонов: {info.get('freeTicketCount')})\n\n"
-               f"Запись: https://gorzdrav.spb.ru/service-free-schedule")
+               f"Запись: {schedule_link(sub)}")
         return msg, upd
     return None, upd
 
@@ -301,6 +301,7 @@ MENU = (
     "Я слежу за свободными талонами к врачам ГорЗдрава СПб (проверка раз в 30 секунд).\n\n"
     "• Подписаться — пошаговый выбор: район → поликлиника → специализация → врач → промежуток дат\n"
     "• Поиск <запрос> — быстрый поиск, например: поиск Адмиралтейский 111 терапевт Иванова\n"
+    "• Пришлите ссылку на расписание с gorzdrav.spb.ru — сразу перейду к выбору врача\n"
     "• Мои подписки — список подписок\n"
     "• Отписаться [номер|все]\n"
     "• Промежуток <номер> <даты> — изменить промежуток, например: промежуток 1 01.11-10.11\n"
@@ -356,8 +357,72 @@ def short_name(name: str, keep_note: bool = False) -> str:
     return f"{res} {note}" if keep_note and note else res
 
 
-def lpu_label(l) -> str:
-    return l.get("lpuShortName") or l["lpuFullName"]
+def lpu_label(l, with_addr: bool = False) -> str:
+    name = l.get("lpuShortName") or l["lpuFullName"]
+    if with_addr:
+        parts = [x.strip() for x in (l.get("address") or "").split(",")]
+        addr = ", ".join(x for x in parts[2:4] if x)  # 3-й и 4-й элементы
+        if addr:
+            return f"{name} ({addr})"
+    return name
+
+
+def schedule_link(sub) -> str:
+    parts = []
+    if sub.get("district_id"):
+        parts.append({"district": str(sub["district_id"])})
+    parts += [{"lpu": str(sub["lpu_id"])}, {"speciality": str(sub["spec_id"])}]
+    frag = urllib.parse.quote(json.dumps(parts, separators=(",", ":")), safe=":,")
+    return "https://gorzdrav.spb.ru/service-free-schedule#" + frag
+
+
+def parse_link(text: str):
+    """Достаёт параметры district/lpu/speciality[/doctor] из ссылки на расписание."""
+    m = re.search(r"gorzdrav\.spb\.ru/\S*?#(\S+)", text)
+    if not m:
+        return None
+    try:
+        arr = json.loads(urllib.parse.unquote(m.group(1)))
+    except ValueError:
+        return None
+    out = {}
+    for d in arr if isinstance(arr, list) else []:
+        if isinstance(d, dict):
+            out.update({k: str(v) for k, v in d.items()})
+    return out if out.get("lpu") and out.get("speciality") else None
+
+
+def start_from_link(uid, params):
+    ctx = {}
+    try:
+        districts = cached("/shared/districts")
+        did = params.get("district")
+        ctx["district"] = next((d for d in districts if str(d["id"]) == did), None)
+        scan = [ctx["district"]] if ctx["district"] else districts
+        for d in scan:
+            lpu = next((l for l in cached(f"/shared/district/{d['id']}/lpus")
+                        if str(l["id"]) == params["lpu"]), None)
+            if lpu:
+                ctx["district"], ctx["lpu"] = d, lpu
+                break
+        if "lpu" not in ctx:
+            raise LookupError("поликлиника")
+        ctx["spec"] = next((x for x in cached(f"/schedule/lpu/{params['lpu']}/specialties", ttl=300)
+                            if str(x["id"]) == params["speciality"]), None)
+        if not ctx["spec"]:
+            raise LookupError("специализация")
+        stage = "doctor"
+        if params.get("doctor"):
+            doc = next((x for x in fetch_doctors(ctx["lpu"]["id"], ctx["spec"]["id"])
+                        if str(x["id"]) == params["doctor"]), None)
+            if doc:
+                ctx["doctor"], stage = doc, "range"
+    except LookupError as e:
+        send(uid, f"Не нашёл в ссылке: {e}.", kb_main())
+        return
+    send(uid, f"✔ {lpu_label(ctx['lpu'])}\n✔ {ctx['spec']['name']}")
+    STATE[uid] = {"stage": stage, "ctx": ctx, "hints": [], "options": []}
+    run_stage(uid)
 
 
 def items_for(stage, ctx):
@@ -365,7 +430,7 @@ def items_for(stage, ctx):
         return [{"label": d["name"], "text": d["name"], "val": d} for d in cached("/shared/districts")]
     if stage == "lpu":
         res = cached(f"/shared/district/{ctx['district']['id']}/lpus")
-        return [{"label": lpu_label(l),
+        return [{"label": lpu_label(l, True),
                  "text": " ".join(filter(None, [l["lpuFullName"], l.get("lpuShortName"),
                                                 l.get("address"), l.get("description")])),
                  "val": l} for l in res if l.get("isActive", True)]
@@ -457,6 +522,7 @@ def finish_subscription(uid, d_from, d_to):
     c = st["ctx"]
     sub = {
         "id": str(int(time.time() * 1000)),
+        "district_id": (c.get("district") or {}).get("id"),
         "lpu_id": c["lpu"]["id"], "lpu_name": lpu_label(c["lpu"]),
         "spec_id": c["spec"]["id"], "spec_name": c["spec"]["name"],
         "doctor_id": c["doctor"]["id"], "doctor_name": short_name(c["doctor"]["name"]),
@@ -578,8 +644,11 @@ def handle(uid, text):
     word, _, rest = text.partition(" ")
     word = norm(word)
     st = STATE.get(uid)
+    link = parse_link(text) if "gorzdrav.spb.ru" in low else None
 
-    if low in ("отмена", "меню", "начать", "/start", "start", "помощь"):
+    if link:
+        start_from_link(uid, link)
+    elif low in ("отмена", "меню", "начать", "/start", "start", "помощь"):
         STATE.pop(uid, None)
         send(uid, MENU, kb_main())
     elif low in ("мои подписки", "подписки"):

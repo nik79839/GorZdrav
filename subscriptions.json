@@ -1,0 +1,18 @@
+{
+  "227899871": [
+    {
+      "id": "1792491659310",
+      "district_id": "15",
+      "lpu_id": 221,
+      "lpu_name": "ДГП №30",
+      "spec_id": "38",
+      "spec_name": "ПЕДИАТР (ДЕТИ ДО ГОДА)",
+      "doctor_id": "п30.397",
+      "doctor_name": "8 у.П.",
+      "date_from": null,
+      "date_to": null,
+      "seen": [],
+      "last_nearest": "2026-10-27T00:00:00"
+    }
+  ]
+}
