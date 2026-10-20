@@ -7,6 +7,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+from collections import deque
 from copy import deepcopy
 from datetime import date, datetime, timedelta, timezone
 
@@ -341,12 +342,30 @@ TITLES = {"district": "Выберите район", "lpu": "Выберите п
 STATE = {}  # uid -> {"stage", "ctx", "hints", "options"}; трогается только из потока longpoll
 
 
+def short_name(name: str, keep_note: bool = False) -> str:
+    """'Иванова Мария Петровна (нет приема 1.11)' -> 'Иванова М.П.'"""
+    m = re.search(r"\s*(\(.*\))\s*$", name)
+    note = m.group(1) if m else ""
+    parts = (name[:m.start()] if m else name).split()
+    if len(parts) >= 3:
+        res = f"{parts[0]} {parts[1][0]}.{parts[2][0]}."
+    elif len(parts) == 2:
+        res = f"{parts[0]} {parts[1][0]}."
+    else:
+        res = name.strip()
+    return f"{res} {note}" if keep_note and note else res
+
+
+def lpu_label(l) -> str:
+    return l.get("lpuShortName") or l["lpuFullName"]
+
+
 def items_for(stage, ctx):
     if stage == "district":
         return [{"label": d["name"], "text": d["name"], "val": d} for d in cached("/shared/districts")]
     if stage == "lpu":
         res = cached(f"/shared/district/{ctx['district']['id']}/lpus")
-        return [{"label": l["lpuFullName"],
+        return [{"label": lpu_label(l),
                  "text": " ".join(filter(None, [l["lpuFullName"], l.get("lpuShortName"),
                                                 l.get("address"), l.get("description")])),
                  "val": l} for l in res if l.get("isActive", True)]
@@ -358,10 +377,10 @@ def items_for(stage, ctx):
         out = []
         for d in res:
             if d.get("freeTicketCount", 0) > 0 and d.get("nearestDate"):
-                extra = f" — ближайшая {fmt_dt(d['nearestDate'])}"
+                extra = f" — ближайшая {fmt_date(d['nearestDate'])}"
             else:
                 extra = " — нет талонов"
-            out.append({"label": d["name"] + extra, "text": d["name"], "val": d})
+            out.append({"label": short_name(d["name"], keep_note=True) + extra, "text": d["name"], "val": d})
         return out
     return []
 
@@ -438,9 +457,9 @@ def finish_subscription(uid, d_from, d_to):
     c = st["ctx"]
     sub = {
         "id": str(int(time.time() * 1000)),
-        "lpu_id": c["lpu"]["id"], "lpu_name": c["lpu"]["lpuFullName"],
+        "lpu_id": c["lpu"]["id"], "lpu_name": lpu_label(c["lpu"]),
         "spec_id": c["spec"]["id"], "spec_name": c["spec"]["name"],
-        "doctor_id": c["doctor"]["id"], "doctor_name": c["doctor"]["name"],
+        "doctor_id": c["doctor"]["id"], "doctor_name": short_name(c["doctor"]["name"]),
         "date_from": d_from.isoformat() if d_from else None,
         "date_to": d_to.isoformat() if d_to else None,
         "seen": [], "last_nearest": None,
@@ -590,7 +609,8 @@ def main():
     session = vk_api.VkApi(token=VK_TOKEN)
     vk = session.get_api()
     threading.Thread(target=poller, daemon=True).start()
-    log.info("Бот запущен, опрос каждые %s с", POLL_INTERVAL)
+    log.info("Бот запущен (pid %s), опрос каждые %s с", os.getpid(), POLL_INTERVAL)
+    recent_ids = deque(maxlen=500)  # защита от повторной доставки одного и того же сообщения
 
     while True:
         try:
@@ -600,6 +620,10 @@ def main():
                     continue
                 if event.user_id not in ALLOWED_USERS:
                     continue
+                if event.message_id in recent_ids:
+                    log.info("duplicate event %s skipped", event.message_id)
+                    continue
+                recent_ids.append(event.message_id)
                 try:
                     handle(event.user_id, event.text)
                 except Exception:
