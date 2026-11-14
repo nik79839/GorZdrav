@@ -12,6 +12,7 @@ from copy import deepcopy
 from datetime import date, datetime, timedelta, timezone
 
 import requests
+import urllib3
 import vk_api
 from vk_api.keyboard import VkKeyboard, VkKeyboardColor
 from vk_api.longpoll import VkEventType, VkLongPoll
@@ -19,7 +20,7 @@ from vk_api.utils import get_random_id
 
 # ============================== НАСТРОЙКИ ==============================
 VK_TOKEN = "vk1.a.NtlIW2sPiZihemQK3FFq7gHleSEHsQW-WDnbZMJgXdY_PqjP169r5T_74y_Lmi8NUK_EWNuFedzjnSqodMcd3emNMjF0kvra2qoztMSOo_l6axkfDIKMBFO2B5mPJT6963nFl8TBpF6JqKSg4qYlw4qG2zIE2bxxNZzIRVuaSTMJhzWtoPPzyislISWVfyOu51jmqSH6hKiSZqhfbvomOg"
-ALLOWED_USERS = {124970852, 227899871}
+ALLOWED_USERS = {124970852, 227899871, 61223440, 246752702}
 POLL_INTERVAL = 30
 DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "subscriptions.json")
 # =======================================================================
@@ -40,6 +41,9 @@ def now_msk() -> datetime:
 
 # ------------------------------ API ГорЗдрава ------------------------------
 _http = requests.Session()
+_http.verify = False
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+#_http.proxies = {"http": "direct", "https": "direct"}
 _http.headers.update({"User-Agent": "Mozilla/5.0 (gorzdrav-vk-bot)", "Accept": "application/json"})
 _static_cache = {}
 
@@ -676,6 +680,7 @@ def handle(uid, text):
 def main():
     global vk
     session = vk_api.VkApi(token=VK_TOKEN)
+    #session.http.proxies = {"http": "direct", "https": "direct"}
     vk = session.get_api()
     threading.Thread(target=poller, daemon=True).start()
     log.info("Бот запущен (pid %s), опрос каждые %s с", os.getpid(), POLL_INTERVAL)
@@ -684,6 +689,7 @@ def main():
     while True:
         try:
             longpoll = VkLongPoll(session)
+            #longpoll.session.proxies = {"http": "direct", "https": "direct"}
             for event in longpoll.listen():
                 if event.type != VkEventType.MESSAGE_NEW or not event.to_me or not event.text:
                     continue
@@ -708,3 +714,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
