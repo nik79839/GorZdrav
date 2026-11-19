@@ -20,7 +20,6 @@ from vk_api.utils import get_random_id
 
 # ============================== НАСТРОЙКИ ==============================
 VK_TOKEN = "vk1.a.NtlIW2sPiZihemQK3FFq7gHleSEHsQW-WDnbZMJgXdY_PqjP169r5T_74y_Lmi8NUK_EWNuFedzjnSqodMcd3emNMjF0kvra2qoztMSOo_l6axkfDIKMBFO2B5mPJT6963nFl8TBpF6JqKSg4qYlw4qG2zIE2bxxNZzIRVuaSTMJhzWtoPPzyislISWVfyOu51jmqSH6hKiSZqhfbvomOg"
-ALLOWED_USERS = {124970852, 227899871, 61223440, 246752702}
 POLL_INTERVAL = 30
 DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "subscriptions.json")
 # =======================================================================
@@ -692,8 +691,6 @@ def main():
             #longpoll.session.proxies = {"http": "direct", "https": "direct"}
             for event in longpoll.listen():
                 if event.type != VkEventType.MESSAGE_NEW or not event.to_me or not event.text:
-                    continue
-                if event.user_id not in ALLOWED_USERS:
                     continue
                 if event.message_id in recent_ids:
                     log.info("duplicate event %s skipped", event.message_id)
