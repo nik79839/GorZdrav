@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+"""
+VK-бот: подписка на врачей ГорЗдрава СПб и уведомления о появлении записи.
+
+Запуск:  VK_TOKEN=xxxx python gorzdrav_bot.py
+"""
 import json
 import logging
 import os
@@ -12,7 +17,6 @@ from copy import deepcopy
 from datetime import date, datetime, timedelta, timezone
 
 import requests
-import urllib3
 import vk_api
 from vk_api.keyboard import VkKeyboard, VkKeyboardColor
 from vk_api.longpoll import VkEventType, VkLongPoll
@@ -161,6 +165,8 @@ def has_range(sub) -> bool:
 def range_text(sub) -> str:
     if not has_range(sub):
         return "любой (сообщу, когда появится запись или станет ближе)"
+    if sub.get("date_from") and sub.get("date_from") == sub.get("date_to"):
+        return fmt_date(sub["date_from"])
     f = fmt_date(sub["date_from"]) if sub.get("date_from") else "…"
     t = fmt_date(sub["date_to"]) if sub.get("date_to") else "…"
     return f"{f} — {t}"
@@ -307,7 +313,7 @@ MENU = (
     "• Пришлите ссылку на расписание с gorzdrav.spb.ru — сразу перейду к выбору врача\n"
     "• Мои подписки — список подписок\n"
     "• Отписаться [номер|все]\n"
-    "• Промежуток <номер> <даты> — изменить промежуток, например: промежуток 1 01.11-10.11\n"
+    "• Промежуток <номер> <дата или даты> — изменить, например: промежуток 1 05.11\n"
     "• Отмена — выйти из текущего диалога"
 )
 
@@ -463,7 +469,7 @@ def run_stage(uid, typed=False):
     while True:
         stage = st["stage"]
         if stage == "range":
-            send(uid, "Укажите промежуток дат для записи, например «01.11-10.11», «с 05.11» или «до 20.11».\n"
+            send(uid, "Укажите дату или промежуток, например «05.11», «01.11-10.11», «с 05.11» или «до 20.11».\n"
                       "Напишите «любой», если ограничений нет — тогда сообщу, когда появится запись "
                       "или найдётся более ранняя.", kb_cancel())
             return
@@ -564,7 +570,12 @@ def parse_range(text: str):
     t = norm(text.strip())
     if t in ("любой", "любая", "нет", "все", "без ограничений", "-", "–"):
         return None, None
-    t = re.sub(r"^с\s+", "", t)
+    m = re.fullmatch(r"(?:на\s+)?(\d{1,2}\.\d{1,2}(?:\.\d{2,4})?)", t)
+    if m:  # одна конкретная дата
+        d = parse_one_date(m.group(1), now_msk().date())
+        return d, d
+    m = re.fullmatch(r"с\s+(\S+)", t)  # «с 05.11» - только начало
+    t = m.group(1) + "-" if m else re.sub(r"^с\s+", "", t)
     t = re.sub(r"^до\s+", "-", t)
     parts = re.split(r"\s*(?:-|–|—|\bпо\b)\s*", t)
     if len(parts) != 2 or not (parts[0] or parts[1]):
@@ -711,4 +722,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
