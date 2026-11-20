@@ -11,6 +11,7 @@ import re
 import threading
 import time
 import urllib.parse
+import urllib3
 import urllib.request
 from collections import deque
 from copy import deepcopy
