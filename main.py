@@ -260,9 +260,29 @@ def has_range(sub) -> bool:
     return bool(sub.get("date_from") or sub.get("date_to"))
 
 
+def has_time(sub) -> bool:
+    return bool(sub.get("time_from") or sub.get("time_to"))
+
+
+def uses_slots(sub) -> bool:
+    """Нужны ли отдельные талоны (а не только ближайшая дата врача)."""
+    return has_range(sub) or has_time(sub)
+
+
+def time_text(sub) -> str:
+    f, t = sub.get("time_from"), sub.get("time_to")
+    if f and t:
+        return f"{f}–{t}"
+    return f"после {f}" if f else (f"до {t}" if t else "любое")
+
+
+def filter_text(sub) -> str:
+    return range_text(sub) + (f", время: {time_text(sub)}" if has_time(sub) else "")
+
+
 def range_text(sub) -> str:
     if not has_range(sub):
-        return "любой (сообщу, когда появится запись или станет ближе)"
+        return "любая дата" if has_time(sub) else "любой (сообщу, когда появится запись или станет ближе)"
     if sub.get("date_from") and sub.get("date_from") == sub.get("date_to"):
         return fmt_date(sub["date_from"])
     f = fmt_date(sub["date_from"]) if sub.get("date_from") else "…"
@@ -292,6 +312,9 @@ def window_slots(sub, cache):
         dt = datetime.fromisoformat(a["visitStart"])
         if dt < now or (d_from and dt.date() < d_from) or (d_to and dt.date() > d_to):
             continue
+        tm = dt.strftime("%H:%M")
+        if (sub.get("time_from") and tm < sub["time_from"]) or (sub.get("time_to") and tm >= sub["time_to"]):
+            continue
         out.append(a)
     out.sort(key=lambda a: a["visitStart"])
     return out
@@ -317,7 +340,7 @@ def slot_offer(a):
 
 def check_sub(sub, cache):
     """Возвращает (текст уведомления | None, обновления состояния, предложенные талоны)."""
-    if has_range(sub):
+    if uses_slots(sub):
         slots = window_slots(sub, cache)
         seen = set(sub.get("seen", []))
         new = [a for a in slots if a["id"] not in seen]
@@ -326,7 +349,7 @@ def check_sub(sub, cache):
             return None, upd, []
         offers = [slot_offer(a) for a in new[:5]]
         upd["offers"] = offers
-        msg = (f"🔔 Новые талоны в вашем промежутке ({range_text(sub)})!\n\n{sub_header(sub)}\n\n"
+        msg = (f"🔔 Новые талоны ({filter_text(sub)})!\n\n{sub_header(sub)}\n\n"
                f"{slots_lines(new)}\n\nЗапись: {schedule_link(sub)}")
         return msg, upd, offers
 
@@ -355,11 +378,11 @@ def baseline(sub) -> str:
     _, upd, _ = check_sub(sub, cache)
     upd.pop("offers", None)
     sub.update(upd)
-    if has_range(sub):
+    if uses_slots(sub):
         slots = window_slots(sub, cache)
         if not slots:
-            return "В выбранном промежутке сейчас свободных талонов нет."
-        return f"В промежутке сейчас талонов: {len(slots)}, ближайший — {fmt_dt(slots[0]['visitStart'])}."
+            return "По вашим условиям сейчас свободных талонов нет."
+        return f"По вашим условиям сейчас талонов: {len(slots)}, ближайший — {fmt_dt(slots[0]['visitStart'])}."
     info = doctor_info(sub, cache)
     if info is None:
         return "Врача сейчас нет в списке расписания, но я продолжу следить."
@@ -458,6 +481,14 @@ def kb_main():
     return kb
 
 
+def kb_time():
+    kb = VkKeyboard(one_time=False)
+    kb.add_button("Любое время", VkKeyboardColor.PRIMARY)
+    kb.add_line()
+    kb.add_button("Отмена", VkKeyboardColor.NEGATIVE)
+    return kb
+
+
 def kb_yesno():
     kb = VkKeyboard(one_time=False)
     kb.add_button("Да, автозапись", VkKeyboardColor.POSITIVE)
@@ -502,6 +533,7 @@ MENU = (
     "• Мои подписки — список подписок\n"
     "• Отписаться [номер|все]\n"
     "• Промежуток <номер> <дата или даты> — изменить, например: промежуток 1 05.11\n"
+    "• Время <номер> <условие> — фильтр по времени, например: время 1 после 17:00\n"
     "• Карточка — ФИО и дата рождения для записи (удалить: «удалить карточку»)\n"
     "• Автозапись <номер> вкл|выкл — бот сам запишет на самый ранний талон\n"
     "• Отмена — выйти из текущего диалога"
@@ -693,6 +725,10 @@ def pick(uid, item):
     st["stage"] = STAGES[i + 1] if i + 1 < len(STAGES) else "range"
 
 
+TIME_PROMPT = ("Укажите время приёма: «после 17:00», «до 12:00» или «10:00-14:00». "
+               "Если время не важно, нажмите «Любое время».")
+
+
 def wizard_reply(uid, text):
     st = STATE[uid]
     stage = st["stage"]
@@ -704,6 +740,15 @@ def wizard_reply(uid, text):
             st["range"] = parse_range(text)
         except ValueError as e:
             send(uid, f"{e}\nПример: 01.11-10.11")
+            return
+        st["stage"] = "time"
+        send(uid, TIME_PROMPT, kb_time())
+        return
+    if stage == "time":
+        try:
+            st["time"] = parse_time_filter(text)
+        except ValueError as e:
+            send(uid, f"{e}\nПример: после 17:00")
             return
         st["stage"] = "auto"
         send(uid, "Записать вас автоматически?\nЕсли «Да», при появлении талона бот сам запишет вас на самый "
@@ -741,6 +786,7 @@ def finish_subscription(uid, auto=False):
     st = STATE.pop(uid)
     c = st["ctx"]
     d_from, d_to = st["range"]
+    t_from, t_to = st.get("time", (None, None))
     sub = {
         "id": str(int(time.time() * 1000)),
         "district_id": (c.get("district") or {}).get("id"),
@@ -749,6 +795,7 @@ def finish_subscription(uid, auto=False):
         "doctor_id": c["doctor"]["id"], "doctor_name": short_name(c["doctor"]["name"]),
         "date_from": d_from.isoformat() if d_from else None,
         "date_to": d_to.isoformat() if d_to else None,
+        "time_from": t_from, "time_to": t_to,
         "seen": [], "last_nearest": None,
         "auto_book": False, "failed": [], "offers": [],
     }
@@ -772,6 +819,7 @@ def finish_subscription(uid, auto=False):
     replaced = store.add(uid, sub)
     send(uid, f"{'Подписка обновлена' if replaced else 'Подписка оформлена'} ✅\n\n{sub_header(sub)}\n"
               f"Промежуток: {range_text(sub)}\n"
+              + (f"Время: {time_text(sub)}\n" if has_time(sub) else "") +
               f"Автозапись: {'включена ✅' if sub['auto_book'] else 'нет'}\n\n{info}{note}", kb_main())
 
 
@@ -971,6 +1019,57 @@ def parse_range(text: str):
     return d_from, d_to
 
 
+def parse_hhmm(s: str) -> str:
+    m = re.fullmatch(r"(\d{1,2})(?:[:.](\d{2}))?", s.strip())
+    if not m or int(m.group(1)) > 23 or int(m.group(2) or 0) > 59:
+        raise ValueError(f"Не понял время «{s.strip()}».")
+    return f"{int(m.group(1)):02d}:{m.group(2) or '00'}"
+
+
+def parse_time_filter(text: str):
+    """'после 17:00' / 'до 12' / '10:00-14:00' / 'любое' -> (from|None, to|None)."""
+    t = norm(text.strip())
+    if t.startswith("люб") or t in ("нет", "все", "без ограничений", "-", "–"):
+        return None, None
+    m = re.fullmatch(r"(?:после|с)\s+(\S+)", t)
+    if m:
+        return parse_hhmm(m.group(1)), None
+    m = re.fullmatch(r"до\s+(\S+)", t)
+    if m:
+        return None, parse_hhmm(m.group(1))
+    m = re.fullmatch(r"(?:с\s+)?(\S+?)\s*(?:-|–|—|до|по)\s*(\S+)", t)
+    if not m:
+        raise ValueError("Не понял время.")
+    t_from, t_to = parse_hhmm(m.group(1)), parse_hhmm(m.group(2))
+    if t_from >= t_to:
+        raise ValueError("Начало должно быть раньше конца.")
+    return t_from, t_to
+
+
+def cmd_time(uid, rest):
+    m = re.match(r"(\d+)\s+(.+)", rest.strip())
+    subs = store.list(uid)
+    if not m or not (1 <= int(m.group(1)) <= len(subs)):
+        send(uid, "Формат: время <номер подписки> <условие>, например: время 1 после 17:00 (или «любое»)")
+        return
+    sub = subs[int(m.group(1)) - 1]
+    try:
+        sub["time_from"], sub["time_to"] = parse_time_filter(m.group(2))
+    except ValueError as e:
+        send(uid, str(e))
+        return
+    sub["seen"], sub["last_nearest"] = [], None
+    try:
+        info = baseline(sub)
+    except Exception as e:
+        log.warning("baseline failed: %s", e)
+        send(uid, "Не удалось связаться с ГорЗдравом, попробуйте позже.")
+        return
+    store.update(uid, sub["id"], time_from=sub["time_from"], time_to=sub["time_to"],
+                 seen=sub["seen"], last_nearest=sub["last_nearest"])
+    send(uid, f"Время обновлено: {time_text(sub)}\n{info}", kb_main())
+
+
 # ------------------------------ Команды ------------------------------
 def show_subs(uid):
     subs = store.list(uid)
@@ -978,6 +1077,7 @@ def show_subs(uid):
         send(uid, "Подписок пока нет. Нажмите «Подписаться».", kb_main())
         return subs
     blocks = [f"{i}. {s['doctor_name']}\n   {s['lpu_name']} · {s['spec_name']}\n   Промежуток: {range_text(s)}"
+              + (f"\n   Время: {time_text(s)}" if has_time(s) else "")
               + ("\n   Автозапись: включена" if s.get("auto_book") else "")
               for i, s in enumerate(subs, 1)]
     send(uid, "Ваши подписки:\n\n" + "\n\n".join(blocks), kb_main())
@@ -1062,6 +1162,8 @@ def handle(uid, text):
         ask_fio(uid)
     elif low in ("удалить карточку", "удалить данные"):
         cmd_del_card(uid)
+    elif word == "время":
+        cmd_time(uid, rest)
     elif word == "автозапись":
         cmd_auto(uid, rest)
     elif word == "записаться":
