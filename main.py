@@ -27,6 +27,7 @@ from vk_api.utils import get_random_id
 VK_TOKEN = "vk1.a.NtlIW2sPiZihemQK3FFq7gHleSEHsQW-WDnbZMJgXdY_PqjP169r5T_74y_Lmi8NUK_EWNuFedzjnSqodMcd3emNMjF0kvra2qoztMSOo_l6axkfDIKMBFO2B5mPJT6963nFl8TBpF6JqKSg4qYlw4qG2zIE2bxxNZzIRVuaSTMJhzWtoPPzyislISWVfyOu51jmqSH6hKiSZqhfbvomOg"
 POLL_INTERVAL = 30
 DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "subscriptions.json")
+PROFILE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "profiles.json")
 # =======================================================================
 
 BASE = "https://gorzdrav.spb.ru/_api/api/v2"
@@ -93,6 +94,66 @@ def fetch_appointments(lpu_id, doctor_id):
     return api_get(f"/schedule/lpu/{lpu_id}/doctor/{enc(doctor_id)}/appointments")
 
 
+class PatientNotFound(Exception):
+    pass
+
+
+def api_call(method: str, path: str, **kw) -> dict:
+    """Запрос без повторов (для POST повтор небезопасен). Возвращает JSON-ответ как dict."""
+    r = _http.request(method, BASE + path, timeout=20, **kw)
+    try:
+        data = r.json()
+    except ValueError:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    if r.status_code >= 400 and not data:
+        raise RuntimeError(f"HTTP {r.status_code} {path}")
+    return data
+
+
+def find_patient(lpu_id, prof) -> str:
+    """Проверяет, есть ли пациент в поликлинике; возвращает patientId для записи."""
+    data = api_call("GET", "/patient/search", params={
+        "lpuId": str(lpu_id),
+        "lastName": prof["last"],
+        "firstName": prof["first"],
+        "middleName": prof.get("middle") or "",
+        "birthdate": f"{prof['birth']}T00:00:00",
+        "birthdateValue": datetime.fromisoformat(prof["birth"]).strftime("%d.%m.%Y"),
+    })
+    if data.get("success") and data.get("result"):
+        return data["result"]
+    raise PatientNotFound(data.get("message") or "пациент не найден")
+
+
+def create_appointment(lpu_id, patient_id, prof, appt):
+    """Возвращает (успех, сообщение сайта, errorCode)."""
+    payload = {
+        "esiaId": None,
+        "lpuId": str(lpu_id),
+        "patientId": patient_id,
+        "appointmentId": appt["id"],
+        "referralId": None,
+        "ipmpiCardId": None,
+        "recipientEmail": prof.get("email") or None,
+        "patientLastName": prof["last"],
+        "patientFirstName": prof["first"],
+        "patientMiddleName": prof.get("middle") or "",
+        "patientBirthdate": f"{prof['birth']}T00:00:00",
+        "room": appt.get("room"),
+        "address": appt.get("address"),
+        "visitDate": appt["visitStart"],
+    }
+    data = api_call("POST", "/appointment/create", json=payload)
+    return bool(data.get("success")), (data.get("message") or ""), data.get("errorCode")
+
+
+# Ошибки, при которых повторять запись на другие талоны бессмысленно
+# 636 - нет прикрепления к медорганизации или участку
+NO_ATTACHMENT_CODES = {636}
+
+
 # ------------------------------ Хранилище ------------------------------
 class Store:
     def __init__(self, path):
@@ -148,6 +209,42 @@ class Store:
 
 
 store = Store(DATA_FILE)
+
+
+class Profiles:
+    """Карточки пациентов: {uid: {last, first, middle, birth(ISO), email}}."""
+
+    def __init__(self, path):
+        self.path = path
+        self.lock = threading.RLock()
+        self.data = {}
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as f:
+                self.data = json.load(f)
+
+    def _save(self):
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(self.data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, self.path)
+
+    def get(self, uid):
+        with self.lock:
+            return deepcopy(self.data.get(str(uid)))
+
+    def set(self, uid, prof):
+        with self.lock:
+            self.data[str(uid)] = prof
+            self._save()
+
+    def delete(self, uid) -> bool:
+        with self.lock:
+            had = self.data.pop(str(uid), None) is not None
+            self._save()
+            return had
+
+
+profiles = Profiles(PROFILE_FILE)
 
 
 # ------------------------------ Проверка подписок ------------------------------
@@ -214,37 +311,49 @@ def slots_lines(slots, limit=10):
     return "\n".join(lines)
 
 
+def slot_offer(a):
+    return {k: a.get(k) for k in ("id", "visitStart", "room", "address")}
+
+
 def check_sub(sub, cache):
-    """Возвращает (текст уведомления | None, обновления состояния подписки)."""
+    """Возвращает (текст уведомления | None, обновления состояния, предложенные талоны)."""
     if has_range(sub):
         slots = window_slots(sub, cache)
         seen = set(sub.get("seen", []))
         new = [a for a in slots if a["id"] not in seen]
         upd = {"seen": [a["id"] for a in slots]}
         if not new:
-            return None, upd
+            return None, upd, []
+        offers = [slot_offer(a) for a in new[:5]]
+        upd["offers"] = offers
         msg = (f"🔔 Новые талоны в вашем промежутке ({range_text(sub)})!\n\n{sub_header(sub)}\n\n"
-               f"{slots_lines(new)}\n\nЗапись: https://gorzdrav.spb.ru/service-free-schedule")
-        return msg, upd
+               f"{slots_lines(new)}\n\nЗапись: {schedule_link(sub)}")
+        return msg, upd, offers
 
     info = doctor_info(sub, cache)
     if info is None:
-        return None, {}
+        return None, {}, []
     nearest = info.get("nearestDate") if info.get("freeTicketCount", 0) > 0 else None
     last = sub.get("last_nearest")
     upd = {"last_nearest": nearest}
     if nearest and (last is None or nearest < last):
+        try:
+            offers = [slot_offer(a) for a in window_slots(sub, cache)[:5]]
+        except Exception:
+            offers = []
+        upd["offers"] = offers
         msg = (f"🔔 Появилась запись!\n\n{sub_header(sub)}\n\nБлижайшая дата: {fmt_date(nearest)} "
                f"(свободных талонов: {info.get('freeTicketCount')})\n\n"
                f"Запись: {schedule_link(sub)}")
-        return msg, upd
-    return None, upd
+        return msg, upd, offers
+    return None, upd, []
 
 
 def baseline(sub) -> str:
     """Запоминает текущее состояние (чтобы не слать уже известное) и возвращает описание."""
     cache = {}
-    _, upd = check_sub(sub, cache)
+    _, upd, _ = check_sub(sub, cache)
+    upd.pop("offers", None)
     sub.update(upd)
     if has_range(sub):
         slots = window_slots(sub, cache)
@@ -259,13 +368,69 @@ def baseline(sub) -> str:
     return "Свободных талонов сейчас нет."
 
 
+def booked_text(sub, appt) -> str:
+    place = ", ".join(x for x in [f"каб. {appt['room']}" if appt.get("room") else "", appt.get("address") or ""] if x)
+    return (f"✅ Вы записаны!\n\n{sub_header(sub)}\n{fmt_dt(appt['visitStart'])}" + (f"\n{place}" if place else "") +
+            "\n\nПодписка снята. Отменить или перенести запись можно на сайте ГорЗдрава или в поликлинике.")
+
+
+MAX_FAILED_SLOTS = 6
+
+
+def try_auto_book(uid, sub, cache) -> bool:
+    """Автозапись на самый ранний талон. True - записали (подписка снята)."""
+    prof = profiles.get(uid)
+    if not prof:
+        return False
+    failed = set(sub.get("failed", []))
+    slots = [a for a in window_slots(sub, cache) if a["id"] not in failed]
+    if not slots:
+        return False
+    try:
+        patient_id = find_patient(sub["lpu_id"], prof)
+    except PatientNotFound as e:
+        store.update(uid, sub["id"], auto_book=False)
+        sub["auto_book"] = False
+        send(uid, f"⚠ Автозапись отключена: в поликлинике не найден пациент ({e}). "
+                  f"Уведомления продолжатся.\n\n{sub_header(sub)}")
+        return False
+    last_err = ""
+    for a in slots[:3]:
+        ok, err, code = create_appointment(sub["lpu_id"], patient_id, prof, a)
+        if ok:
+            store.remove(uid, sub["id"])
+            send(uid, booked_text(sub, a), kb_main())
+            return True
+        if code in NO_ATTACHMENT_CODES:
+            store.update(uid, sub["id"], auto_book=False)
+            sub["auto_book"] = False
+            send(uid, f"⚠ Автозапись отключена: {err}\n\nУведомления о талонах продолжатся.\n\n{sub_header(sub)}")
+            return False
+        failed.add(a["id"])
+        last_err = err
+    upd = {"failed": list(failed)}
+    note = ""
+    if len(failed) >= MAX_FAILED_SLOTS:
+        upd["auto_book"] = False
+        sub["auto_book"] = False
+        note = " Автозапись отключена, остаются уведомления."
+    store.update(uid, sub["id"], **upd)
+    send(uid, f"⚠ Автозапись не удалась: {last_err or 'сайт отклонил запись'}.{note}\n\n{sub_header(sub)}")
+    return False
+
+
 def poll_once():
     cache = {}
     for uid, sub in store.snapshot():
         try:
-            msg, upd = check_sub(sub, cache)
+            if sub.get("auto_book") and try_auto_book(uid, sub, cache):
+                continue
+            msg, upd, offers = check_sub(sub, cache)
             if msg:
-                send(uid, msg)  # при ошибке отправки состояние не обновится -> повтор в след. цикл
+                if offers:
+                    msg += ("\n\nЗаписаться можно кнопкой ниже"
+                            + ("" if profiles.get(uid) else " (сначала заполните «Карточку»)") + ".")
+                send(uid, msg, offers_kb(sub, offers))  # при ошибке отправки состояние не обновится -> повтор
             if upd:
                 store.update(uid, sub["id"], **upd)
         except Exception as e:
@@ -289,6 +454,28 @@ def kb_main():
     kb.add_button("Мои подписки")
     kb.add_line()
     kb.add_button("Отписаться", VkKeyboardColor.NEGATIVE)
+    kb.add_button("Карточка")
+    return kb
+
+
+def kb_yesno():
+    kb = VkKeyboard(one_time=False)
+    kb.add_button("Да, автозапись", VkKeyboardColor.POSITIVE)
+    kb.add_button("Нет, только уведомлять", VkKeyboardColor.SECONDARY)
+    return kb
+
+
+def offers_kb(sub, offers):
+    """Inline-кнопки «Записаться» под уведомлением (до 5 талонов)."""
+    if not offers:
+        return None
+    kb = VkKeyboard(inline=True)
+    surname = sub["doctor_name"].split()[0]
+    for i, a in enumerate(offers[:5]):
+        if i:
+            kb.add_line()
+        stamp = datetime.fromisoformat(a["visitStart"]).strftime("%d.%m %H:%M")
+        kb.add_button(f"Записаться {stamp} {surname}"[:40], VkKeyboardColor.POSITIVE)
     return kb
 
 
@@ -315,6 +502,8 @@ MENU = (
     "• Мои подписки — список подписок\n"
     "• Отписаться [номер|все]\n"
     "• Промежуток <номер> <дата или даты> — изменить, например: промежуток 1 05.11\n"
+    "• Карточка — ФИО и дата рождения для записи (удалить: «удалить карточку»)\n"
+    "• Автозапись <номер> вкл|выкл — бот сам запишет на самый ранний талон\n"
     "• Отмена — выйти из текущего диалога"
 )
 
@@ -506,13 +695,34 @@ def pick(uid, item):
 
 def wizard_reply(uid, text):
     st = STATE[uid]
-    if st["stage"] == "range":
+    stage = st["stage"]
+    if stage.startswith("card_"):
+        card_reply(uid, text)
+        return
+    if stage == "range":
         try:
-            d_from, d_to = parse_range(text)
+            st["range"] = parse_range(text)
         except ValueError as e:
             send(uid, f"{e}\nПример: 01.11-10.11")
             return
-        finish_subscription(uid, d_from, d_to)
+        st["stage"] = "auto"
+        send(uid, "Записать вас автоматически?\nЕсли «Да», при появлении талона бот сам запишет вас на самый "
+                  "ранний подходящий (нужна карточка пациента), и подписка снимется. "
+                  "Если «Нет», пришлю уведомление с кнопкой «Записаться».", kb_yesno())
+        return
+    if stage == "auto":
+        low = norm(text)
+        if low.startswith("да"):
+            if profiles.get(uid):
+                finish_subscription(uid, auto=True)
+            else:
+                st["stage"], st["card"], st["pending"] = "card_fio", {}, True
+                ask_fio(uid, "Для автозаписи нужна карточка пациента. Она хранится на сервере бота, "
+                             "удалить можно командой «удалить карточку».\n\n")
+        elif low.startswith("нет"):
+            finish_subscription(uid, auto=False)
+        else:
+            send(uid, "Ответьте «Да» или «Нет».")
         return
     t = text.strip()
     if t.isdigit():
@@ -527,9 +737,10 @@ def wizard_reply(uid, text):
     run_stage(uid, typed=True)
 
 
-def finish_subscription(uid, d_from, d_to):
+def finish_subscription(uid, auto=False):
     st = STATE.pop(uid)
     c = st["ctx"]
+    d_from, d_to = st["range"]
     sub = {
         "id": str(int(time.time() * 1000)),
         "district_id": (c.get("district") or {}).get("id"),
@@ -539,7 +750,19 @@ def finish_subscription(uid, d_from, d_to):
         "date_from": d_from.isoformat() if d_from else None,
         "date_to": d_to.isoformat() if d_to else None,
         "seen": [], "last_nearest": None,
+        "auto_book": False, "failed": [], "offers": [],
     }
+    note = ""
+    if auto:
+        try:
+            find_patient(sub["lpu_id"], profiles.get(uid))
+            sub["auto_book"] = True
+        except PatientNotFound as e:
+            note = (f"\n\n⚠ Автозапись не включена: в этой поликлинике не найден пациент с вашими данными ({e}). "
+                    f"Проверьте «Карточку». Уведомления будут приходить.")
+        except Exception as e:
+            log.warning("patient check failed: %s", e)
+            note = "\n\n⚠ Не удалось проверить карточку в поликлинике, автозапись не включена. Повторить: «автозапись N вкл»."
     try:
         info = baseline(sub)
     except Exception as e:
@@ -548,7 +771,163 @@ def finish_subscription(uid, d_from, d_to):
         return
     replaced = store.add(uid, sub)
     send(uid, f"{'Подписка обновлена' if replaced else 'Подписка оформлена'} ✅\n\n{sub_header(sub)}\n"
-              f"Промежуток: {range_text(sub)}\n\n{info}", kb_main())
+              f"Промежуток: {range_text(sub)}\n"
+              f"Автозапись: {'включена ✅' if sub['auto_book'] else 'нет'}\n\n{info}{note}", kb_main())
+
+
+# ------------------------------ Карточка пациента ------------------------------
+NAME_RE = re.compile(r"[А-Яа-яЁё]+(?:-[А-Яа-яЁё]+)*")
+
+
+def cap_name(w: str) -> str:
+    return "-".join(p[:1].upper() + p[1:].lower() for p in w.split("-"))
+
+
+def ask_fio(uid, intro=""):
+    send(uid, intro + "Введите ФИО полностью, например: Иванов Иван Иванович. "
+                      "Без отчества — только фамилия и имя.", kb_cancel())
+
+
+def card_text(prof) -> str:
+    fio = " ".join(x for x in [prof["last"], prof["first"], prof.get("middle")] if x)
+    birth = datetime.fromisoformat(prof["birth"]).strftime("%d.%m.%Y")
+    return f"{fio}\nДата рождения: {birth}\nE-mail: {prof.get('email') or 'не указан'}"
+
+
+def show_card(uid):
+    prof = profiles.get(uid)
+    if not prof:
+        STATE[uid] = {"stage": "card_fio", "card": {}, "pending": False}
+        ask_fio(uid)
+        return
+    send(uid, f"Ваша карточка:\n{card_text(prof)}\n\nЗаполнить заново: «карточка заново». "
+              f"Удалить: «удалить карточку».", kb_main())
+
+
+def card_reply(uid, text):
+    st = STATE[uid]
+    stage = st["stage"]
+    if stage == "card_fio":
+        words = text.split()
+        if not (2 <= len(words) <= 3) or not all(NAME_RE.fullmatch(w) for w in words):
+            send(uid, "Нужны фамилия, имя и отчество через пробел, только буквы.")
+            return
+        w = [cap_name(x) for x in words]
+        st["card"].update(last=w[0], first=w[1], middle=w[2] if len(w) == 3 else "")
+        st["stage"] = "card_birth"
+        send(uid, "Дата рождения в формате ДД.ММ.ГГГГ:", kb_cancel())
+    elif stage == "card_birth":
+        try:
+            d = datetime.strptime(text.strip(), "%d.%m.%Y").date()
+        except ValueError:
+            send(uid, "Не понял дату. Формат: ДД.ММ.ГГГГ, например 15.03.1998.")
+            return
+        if not (date(1900, 1, 1) <= d <= now_msk().date()):
+            send(uid, "Дата выглядит неверной, проверьте и введите ещё раз.")
+            return
+        st["card"]["birth"] = d.isoformat()
+        st["stage"] = "card_email"
+        send(uid, "E-mail для уведомлений о записи (необязательно). Напишите «-», чтобы пропустить:", kb_cancel())
+    elif stage == "card_email":
+        t = text.strip()
+        if t.lower() in ("-", "нет", "пропустить"):
+            email = ""
+        elif re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", t):
+            email = t
+        else:
+            send(uid, "Не похоже на e-mail. Введите адрес или «-», чтобы пропустить.")
+            return
+        st["card"]["email"] = email
+        profiles.set(uid, st["card"])
+        if st.get("pending"):
+            finish_subscription(uid, auto=True)
+        else:
+            STATE.pop(uid, None)
+            send(uid, f"Карточка сохранена ✅\n{card_text(st['card'])}", kb_main())
+
+
+def cmd_del_card(uid):
+    STATE.pop(uid, None)
+    had = profiles.delete(uid)
+    off = 0
+    for s_ in store.list(uid):
+        if s_.get("auto_book"):
+            store.update(uid, s_["id"], auto_book=False)
+            off += 1
+    send(uid, ("Карточка удалена." if had else "Карточки не было.") +
+         (f" Автозапись отключена у подписок: {off}." if off else ""), kb_main())
+
+
+def cmd_auto(uid, rest):
+    m = re.match(r"(\d+)\s+(вкл\w*|выкл\w*)", norm(rest.strip()))
+    subs = store.list(uid)
+    if not m or not (1 <= int(m.group(1)) <= len(subs)):
+        send(uid, "Формат: автозапись <номер подписки> вкл|выкл, например: автозапись 1 вкл")
+        return
+    sub = subs[int(m.group(1)) - 1]
+    on = m.group(2).startswith("вкл")
+    if on:
+        prof = profiles.get(uid)
+        if not prof:
+            send(uid, "Сначала заполните «Карточку».", kb_main())
+            return
+        try:
+            find_patient(sub["lpu_id"], prof)
+        except PatientNotFound as e:
+            send(uid, f"В поликлинике не найден пациент с вашими данными ({e}). Проверьте «Карточку».", kb_main())
+            return
+        except Exception as e:
+            log.warning("patient check failed: %s", e)
+            send(uid, "Не удалось связаться с ГорЗдравом, попробуйте позже.", kb_main())
+            return
+    store.update(uid, sub["id"], auto_book=on, failed=[])
+    send(uid, f"Автозапись {'включена ✅' if on else 'выключена'}: {sub['doctor_name']}", kb_main())
+
+
+def cmd_book(uid, text):
+    """Нажатие кнопки «Записаться дд.мм чч:мм Фамилия»."""
+    m = re.match(r"записаться\s+(\d{2}\.\d{2})\s+(\d{2}:\d{2})\s*(.*)$", norm(text))
+    if not m:
+        send(uid, "Нажмите кнопку «Записаться» под уведомлением о талоне.", kb_main())
+        return
+    stamp, rest = f"{m.group(1)} {m.group(2)}", m.group(3).strip()
+    found = None
+    for sub in store.list(uid):
+        if rest and not norm(sub["doctor_name"].split()[0]).startswith(rest):
+            continue
+        for o in sub.get("offers", []):
+            if datetime.fromisoformat(o["visitStart"]).strftime("%d.%m %H:%M") == stamp:
+                found = (sub, o)
+                break
+        if found:
+            break
+    if not found:
+        send(uid, "Этого талона уже нет в предложенных. Дождитесь нового уведомления.", kb_main())
+        return
+    sub, offer = found
+    prof = profiles.get(uid)
+    if not prof:
+        STATE[uid] = {"stage": "card_fio", "card": {}, "pending": False}
+        ask_fio(uid, "Для записи нужна карточка пациента. Заполните её, затем нажмите кнопку «Записаться» ещё раз.\n\n")
+        return
+    try:
+        ok, err, code = book(sub, prof, offer)
+    except PatientNotFound as e:
+        send(uid, f"В поликлинике «{sub['lpu_name']}» не найден пациент с вашими данными ({e}). "
+                  f"Проверьте «Карточку».", kb_main())
+        return
+    if ok:
+        store.remove(uid, sub["id"])
+        send(uid, booked_text(sub, offer), kb_main())
+    else:
+        hint = "" if code in NO_ATTACHMENT_CODES else " Возможно, талон уже занят."
+        send(uid, f"Не удалось записаться: {err or 'сайт отклонил запись'}.{hint}\n"
+                  f"Запись вручную: {schedule_link(sub)}", kb_main())
+
+
+def book(sub, prof, appt):
+    patient_id = find_patient(sub["lpu_id"], prof)
+    return create_appointment(sub["lpu_id"], patient_id, prof, appt)
 
 
 # ------------------------------ Разбор дат ------------------------------
@@ -599,6 +978,7 @@ def show_subs(uid):
         send(uid, "Подписок пока нет. Нажмите «Подписаться».", kb_main())
         return subs
     blocks = [f"{i}. {s['doctor_name']}\n   {s['lpu_name']} · {s['spec_name']}\n   Промежуток: {range_text(s)}"
+              + ("\n   Автозапись: включена" if s.get("auto_book") else "")
               for i, s in enumerate(subs, 1)]
     send(uid, "Ваши подписки:\n\n" + "\n\n".join(blocks), kb_main())
     return subs
@@ -674,6 +1054,18 @@ def handle(uid, text):
         cmd_unsub(uid, rest)
     elif word == "промежуток":
         cmd_range(uid, rest)
+    elif low in ("карточка", "моя карточка"):
+        STATE.pop(uid, None)
+        show_card(uid)
+    elif low == "карточка заново":
+        STATE[uid] = {"stage": "card_fio", "card": {}, "pending": False}
+        ask_fio(uid)
+    elif low in ("удалить карточку", "удалить данные"):
+        cmd_del_card(uid)
+    elif word == "автозапись":
+        cmd_auto(uid, rest)
+    elif word == "записаться":
+        cmd_book(uid, text)
     elif word in ("подписаться", "поиск", "найти"):
         start_wizard(uid, tokens(rest))
     elif st and st["stage"] == "unsub":
