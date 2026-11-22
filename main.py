@@ -28,6 +28,9 @@ VK_TOKEN = "vk1.a.NtlIW2sPiZihemQK3FFq7gHleSEHsQW-WDnbZMJgXdY_PqjP169r5T_74y_Lmi
 POLL_INTERVAL = 30
 DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "subscriptions.json")
 PROFILE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "profiles.json")
+MAX_SUBS_PER_USER = 5  # максимум подписок на пользователя
+CONSENT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "consents.json")
+CONSENT_VERSION = 1  # при изменении текста согласия увеличьте: бот запросит согласие заново
 # =======================================================================
 
 BASE = "https://gorzdrav.spb.ru/_api/api/v2"
@@ -245,6 +248,12 @@ class Profiles:
 
 
 profiles = Profiles(PROFILE_FILE)
+consents = Profiles(CONSENT_FILE)  # {uid: {"at": ..., "version": N}}
+
+
+def has_consent(uid) -> bool:
+    c = consents.get(uid)
+    return bool(c and c.get("version") == CONSENT_VERSION)
 
 
 # ------------------------------ Проверка подписок ------------------------------
@@ -445,6 +454,9 @@ def try_auto_book(uid, sub, cache) -> bool:
 def poll_once():
     cache = {}
     for uid, sub in store.snapshot():
+        if not has_consent(uid):
+            ask_consent_once(uid)
+            continue
         try:
             if sub.get("auto_book") and try_auto_book(uid, sub, cache):
                 continue
@@ -489,6 +501,22 @@ def kb_time():
     return kb
 
 
+def kb_consent():
+    kb = VkKeyboard(one_time=False)
+    kb.add_button("Согласен", VkKeyboardColor.POSITIVE)
+    kb.add_line()
+    kb.add_button("Не согласен", VkKeyboardColor.NEGATIVE)
+    return kb
+
+
+def kb_date():
+    kb = VkKeyboard(one_time=False)
+    kb.add_button("Любая дата", VkKeyboardColor.PRIMARY)
+    kb.add_line()
+    kb.add_button("Отмена", VkKeyboardColor.NEGATIVE)
+    return kb
+
+
 def kb_yesno():
     kb = VkKeyboard(one_time=False)
     kb.add_button("Да, автозапись", VkKeyboardColor.POSITIVE)
@@ -525,6 +553,74 @@ def send(uid, text, kb=None):
         vk.messages.send(**params)
 
 
+CONSENT_TEXT = (
+    "Согласие на обработку персональных данных\n\n"
+    "Оператор: Отрашевский Никита Александрович.\n\n"
+    "Нажимая «Согласен», вы разрешаете обрабатывать:\n"
+    "• ваш идентификатор ВКонтакте;\n"
+    "• сведения о подписках: поликлиника, специализация, врач, желаемые дата и время "
+    "(они могут косвенно отражать состояние здоровья);\n"
+    "• по вашему желанию, в «Карточке»: ФИО, дату рождения и e-mail.\n\n"
+    "Цели: присылать уведомления о свободных талонах и записывать вас на приём через сайт "
+    "gorzdrav.spb.ru по вашей команде или при включённой автозаписи. Для записи ФИО и дата рождения "
+    "передаются в ГорЗдрав.\n"
+    "Действия: сбор, хранение, использование, передача в ГорЗдрав для записи, удаление. "
+    "Другим лицам данные не передаются.\n"
+    "Срок: до отзыва согласия.\n"
+    "Отзыв: команда «отозвать согласие», все ваши данные будут удалены."
+)
+
+_consent_asked = set()
+
+
+def ask_consent_once(uid):
+    """Для подписчиков, оформленных до появления согласия: один раз просим согласие по инициативе бота."""
+    if uid in _consent_asked:
+        return
+    _consent_asked.add(uid)
+    try:
+        send(uid, "Уведомления приостановлены: нужно ваше согласие на обработку данных. "
+                  "Нажмите «Согласен», и всё продолжится.\n\n" + CONSENT_TEXT, kb_consent())
+    except Exception as e:
+        log.warning("consent request failed for %s: %s", uid, e)
+
+
+def consent_gate(uid, low):
+    if low.startswith("не согласен") or low in ("нет", "отказываюсь", "отказ"):
+        send(uid, "Без согласия бот не может работать, ничего не сохранено. "
+                  "Если передумаете, напишите «Начать».", kb_consent())
+    elif low.startswith("согласен") or low.startswith("согласна") or low == "да":
+        consents.set(uid, {"at": now_msk().isoformat(timespec="seconds"), "version": CONSENT_VERSION})
+        send(uid, "Спасибо, согласие сохранено ✅\n\n" + MENU, kb_main())
+    else:
+        send(uid, CONSENT_TEXT, kb_consent())
+
+
+def grandfather_existing_users():
+    """Пользователи, у которых уже были подписки до появления согласия, считаются согласившимися.
+    Только если записи о согласии нет вовсе (повышение CONSENT_VERSION не обходится)."""
+    n = 0
+    for uid, _ in store.snapshot():
+        if consents.get(uid) is None:
+            consents.set(uid, {"at": now_msk().isoformat(timespec="seconds"),
+                               "version": CONSENT_VERSION, "legacy": True})
+            n += 1
+    if n:
+        log.info("Согласие проставлено существующим пользователям: %s", n)
+
+
+def cmd_revoke(uid):
+    """Отзыв согласия: удаляем подписки, карточку и само согласие."""
+    STATE.pop(uid, None)
+    for s_ in store.list(uid):
+        store.remove(uid, s_["id"])
+    profiles.delete(uid)
+    consents.delete(uid)
+    _consent_asked.add(uid)
+    send(uid, "Согласие отозвано, все ваши данные удалены: подписки и карточка. "
+              "Чтобы снова пользоваться ботом, напишите «Начать».", kb_consent())
+
+
 MENU = (
     "Я слежу за свободными талонами к врачам ГорЗдрава СПб (проверка раз в 30 секунд).\n\n"
     "• Подписаться — пошаговый выбор: район → поликлиника → специализация → врач → промежуток дат\n"
@@ -535,6 +631,7 @@ MENU = (
     "• Промежуток <номер> <дата или даты> — изменить, например: промежуток 1 05.11\n"
     "• Время <номер> <условие> — фильтр по времени, например: время 1 после 17:00\n"
     "• Карточка — ФИО и дата рождения для записи (удалить: «удалить карточку»)\n"
+    "• Согласие — текст согласия на обработку данных; «отозвать согласие» удалит все ваши данные\n"
     "• Автозапись <номер> вкл|выкл — бот сам запишет на самый ранний талон\n"
     "• Отмена — выйти из текущего диалога"
 )
@@ -624,6 +721,8 @@ def parse_link(text: str):
 
 
 def start_from_link(uid, params):
+    if limit_reached(uid):
+        return
     ctx = {}
     try:
         districts = cached("/shared/districts")
@@ -681,7 +780,18 @@ def items_for(stage, ctx):
     return []
 
 
+def limit_reached(uid) -> bool:
+    if len(store.list(uid)) < MAX_SUBS_PER_USER:
+        return False
+    STATE.pop(uid, None)
+    send(uid, f"У вас уже {MAX_SUBS_PER_USER} подписок, это максимум. "
+              f"Чтобы добавить новую, отпишитесь от ненужной: «Отписаться».", kb_main())
+    return True
+
+
 def start_wizard(uid, hints):
+    if limit_reached(uid):
+        return
     STATE[uid] = {"stage": "district", "ctx": {}, "hints": hints, "options": []}
     run_stage(uid)
 
@@ -692,8 +802,8 @@ def run_stage(uid, typed=False):
         stage = st["stage"]
         if stage == "range":
             send(uid, "Укажите дату или промежуток, например «05.11», «01.11-10.11», «с 05.11» или «до 20.11».\n"
-                      "Напишите «любой», если ограничений нет — тогда сообщу, когда появится запись "
-                      "или найдётся более ранняя.", kb_cancel())
+                      "Нажмите «Любая дата», если ограничений нет — тогда сообщу, когда появится запись "
+                      "или найдётся более ранняя.", kb_date())
             return
         items = items_for(stage, st["ctx"])
         if not items:
@@ -799,6 +909,11 @@ def finish_subscription(uid, auto=False):
         "seen": [], "last_nearest": None,
         "auto_book": False, "failed": [], "offers": [],
     }
+    existing = store.list(uid)
+    if len(existing) >= MAX_SUBS_PER_USER and not any(
+            x["lpu_id"] == sub["lpu_id"] and x["doctor_id"] == sub["doctor_id"] for x in existing):
+        send(uid, f"Достигнут лимит подписок ({MAX_SUBS_PER_USER}). Удалите ненужные: «Отписаться».", kb_main())
+        return
     note = ""
     if auto:
         try:
@@ -996,7 +1111,7 @@ def parse_one_date(s: str, today: date) -> date:
 
 def parse_range(text: str):
     t = norm(text.strip())
-    if t in ("любой", "любая", "нет", "все", "без ограничений", "-", "–"):
+    if t.startswith("люб") or t in ("нет", "все", "без ограничений", "-", "–"):
         return None, None
     m = re.fullmatch(r"(?:на\s+)?(\d{1,2}\.\d{1,2}(?:\.\d{2,4})?)", t)
     if m:  # одна конкретная дата
@@ -1141,6 +1256,10 @@ def handle(uid, text):
     st = STATE.get(uid)
     link = parse_link(text) if "gorzdrav.spb.ru" in low else None
 
+    if not has_consent(uid):
+        consent_gate(uid, low)
+        return
+
     if link:
         start_from_link(uid, link)
     elif low in ("отмена", "меню", "начать", "/start", "start", "помощь"):
@@ -1160,6 +1279,10 @@ def handle(uid, text):
     elif low == "карточка заново":
         STATE[uid] = {"stage": "card_fio", "card": {}, "pending": False}
         ask_fio(uid)
+    elif low in ("согласие", "политика"):
+        send(uid, CONSENT_TEXT)
+    elif low == "отозвать согласие":
+        cmd_revoke(uid)
     elif low in ("удалить карточку", "удалить данные"):
         cmd_del_card(uid)
     elif word == "время":
@@ -1187,6 +1310,7 @@ def main():
     session = vk_api.VkApi(token=VK_TOKEN)
     #session.http.proxies = {"http": "direct", "https": "direct"}
     vk = session.get_api()
+    grandfather_existing_users()
     threading.Thread(target=poller, daemon=True).start()
     log.info("Бот запущен (pid %s), опрос каждые %s с", os.getpid(), POLL_INTERVAL)
     recent_ids = deque(maxlen=500)  # защита от повторной доставки одного и того же сообщения
