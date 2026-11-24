@@ -4,6 +4,7 @@ VK-бот: подписка на врачей ГорЗдрава СПб и ув�
 
 Запуск:  VK_TOKEN=xxxx python gorzdrav_bot.py
 """
+import argparse
 import json
 import logging
 import os
@@ -16,12 +17,54 @@ import urllib.request
 from collections import deque
 from copy import deepcopy
 from datetime import date, datetime, timedelta, timezone
+import os
+
+os.environ["HTTP_PROXY"] = (
+    "http://t2rp-fgproxy.corp.tele2.ru:8080"
+)
+os.environ["HTTPS_PROXY"] = (
+    "http://t2rp-fgproxy.corp.tele2.ru:8080"
+)
 
 import requests
 import vk_api
 from vk_api.keyboard import VkKeyboard, VkKeyboardColor
 from vk_api.longpoll import VkEventType, VkLongPoll
 from vk_api.utils import get_random_id
+
+
+def str2bool(v) -> bool:
+    if isinstance(v, bool):
+        return v
+    t = str(v).strip().lower()
+    if t in ("1", "true", "t", "yes", "y", "on", "да"):
+        return True
+    if t in ("0", "false", "f", "no", "n", "off", "нет", ""):
+        return False
+    raise argparse.ArgumentTypeError(f"ожидается true или false, получено «{v}»")
+
+
+def parse_use_proxy() -> bool:
+    ap = argparse.ArgumentParser(description="VK-бот талонов ГорЗдрава СПб")
+    ap.add_argument("--use-proxy", type=str2bool, nargs="?", const=True, metavar="true|false",
+                    default=str2bool(os.getenv("USE_PROXY", "false")),
+                    help="использовать прокси (по умолчанию false)")
+    return ap.parse_known_args()[0].use_proxy
+
+
+USE_PROXY = parse_use_proxy()
+
+if USE_PROXY:
+    try:
+        import kerberos_proxy_auth
+    except ImportError as e:
+        raise SystemExit(f"Для --use-proxy true нужны kerberos-proxy-auth"
+                         f"(pip install -r requirements.txt): {e}")
+
+
+def configure_proxy(sess):
+    sess.trust_env = False  # иначе переменные окружения перебивают sess.proxies
+    sess.verify = False
 
 # ============================== НАСТРОЙКИ ==============================
 VK_TOKEN = "vk1.a.NtlIW2sPiZihemQK3FFq7gHleSEHsQW-WDnbZMJgXdY_PqjP169r5T_74y_Lmi8NUK_EWNuFedzjnSqodMcd3emNMjF0kvra2qoztMSOo_l6axkfDIKMBFO2B5mPJT6963nFl8TBpF6JqKSg4qYlw4qG2zIE2bxxNZzIRVuaSTMJhzWtoPPzyislISWVfyOu51jmqSH6hKiSZqhfbvomOg"
@@ -51,7 +94,7 @@ def now_msk() -> datetime:
 _http = requests.Session()
 _http.verify = False
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-#_http.proxies = {"http": "direct", "https": "direct"}
+configure_proxy(_http)
 _http.headers.update({"User-Agent": "Mozilla/5.0 (gorzdrav-vk-bot)", "Accept": "application/json"})
 _static_cache = {}
 
@@ -371,7 +414,13 @@ def check_sub(sub, cache):
     if nearest and (last is None or nearest < last):
         try:
             offers = [slot_offer(a) for a in window_slots(sub, cache)[:5]]
-        except Exception:
+            if not offers:
+                raw = len(cache.get(("app", sub["lpu_id"], sub["doctor_id"]), []))
+                log.info("нет талонов для кнопки: %s, в списке врачей талонов=%s, ближайшая дата=%s, "
+                         "эндпоинт appointments вернул=%s (прошедшие и не подходящие под фильтр отброшены)",
+                         sub["doctor_name"], info.get("freeTicketCount"), nearest, raw)
+        except Exception as e:
+            log.warning("не удалось получить талоны для кнопки (%s): %s", sub["doctor_name"], e)
             offers = []
         upd["offers"] = offers
         msg = (f"🔔 Появилась запись!\n\n{sub_header(sub)}\n\nБлижайшая дата: {fmt_date(nearest)} "
@@ -465,6 +514,10 @@ def poll_once():
                 if offers:
                     msg += ("\n\nЗаписаться можно кнопкой ниже"
                             + ("" if profiles.get(uid) else " (сначала заполните «Карточку»)") + ".")
+                else:
+                    msg += ("\n\nКнопки «Записаться» нет: конкретные талоны не отобразились (возможно, их уже "
+                            "заняли, время приёма сегодня прошло или запись доступна только на сайте). "
+                            "Проверьте по ссылке.")
                 send(uid, msg, offers_kb(sub, offers))  # при ошибке отправки состояние не обновится -> повтор
             if upd:
                 store.update(uid, sub["id"], **upd)
@@ -1308,17 +1361,18 @@ def handle(uid, text):
 def main():
     global vk
     session = vk_api.VkApi(token=VK_TOKEN)
-    #session.http.proxies = {"http": "direct", "https": "direct"}
+    configure_proxy(session.http)
     vk = session.get_api()
     grandfather_existing_users()
     threading.Thread(target=poller, daemon=True).start()
-    log.info("Бот запущен (pid %s), опрос каждые %s с", os.getpid(), POLL_INTERVAL)
+    log.info("Бот запущен (pid %s), опрос каждые %s с, прокси: %s", os.getpid(), POLL_INTERVAL,
+             HTTP_PROXY if USE_PROXY else "выключен")
     recent_ids = deque(maxlen=500)  # защита от повторной доставки одного и того же сообщения
 
     while True:
         try:
             longpoll = VkLongPoll(session)
-            #longpoll.session.proxies = {"http": "direct", "https": "direct"}
+            configure_proxy(longpoll.session)  # у Long Poll своя сессия
             for event in longpoll.listen():
                 if event.type != VkEventType.MESSAGE_NEW or not event.to_me or not event.text:
                     continue
